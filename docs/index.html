@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sistema de Visualización de Datos Sísmicos en México</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css" rel="stylesheet">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.7.1/dist/leaflet.css">
+<style>
+ body{background:#f4f6f9;font-family:system-ui,Segoe UI,Roboto,sans-serif}
+ header{background:#1e3a5f;color:#fff;padding:28px 16px;text-align:center}
+ .card{margin-bottom:20px;box-shadow:0 2px 6px rgba(0,0,0,.08)}
+ #mapa-sismos{height:520px;border-radius:6px}
+ #estado{padding:40px;text-align:center;color:#555}
+ canvas{max-height:340px}
+</style>
+</head>
+<body>
+<header>
+ <h1 class="h3">Sistema de Visualización de Datos Sísmicos en México</h1>
+ <p class="mb-0 opacity-75">Sismos (SSN) + población y economía (INEGI) · versión estática</p>
+</header>
+<div id="estado">Cargando datos (≈2.4 MB)…</div>
+<div class="container mt-4" id="app" style="display:none">
+ <div class="card"><div class="card-header"><h5 class="mb-0">Filtros</h5></div><div class="card-body">
+  <div class="row g-3">
+   <div class="col-md-3"><label class="form-label">Fecha inicio</label><input type="date" id="f-ini" class="form-control" min="1900-01-01" max="2025-03-03"></div>
+   <div class="col-md-3"><label class="form-label">Fecha fin</label><input type="date" id="f-fin" class="form-control" min="1900-01-01" max="2025-03-03"></div>
+   <div class="col-md-3"><label class="form-label">Magnitud mínima</label>
+    <select id="f-mag" class="form-select"><option value="0">Todas</option><option value="4">4+</option><option value="5">5+</option><option value="6">6+</option><option value="7">7+</option></select></div>
+   <div class="col-md-3 d-flex align-items-end gap-2">
+    <button class="btn btn-primary" id="b-filtrar">Filtrar</button>
+    <button class="btn btn-secondary" id="b-limpiar">Limpiar</button>
+    <button class="btn btn-success" id="b-csv">CSV</button></div>
+  </div>
+  <p class="mt-3 mb-0" id="resumen"></p>
+ </div></div>
+
+ <div class="card"><div class="card-header"><h5 class="mb-0">Mapa de actividad sísmica</h5></div><div class="card-body">
+  <div id="mapa-sismos"></div><small class="text-muted" id="nota-mapa"></small></div></div>
+
+ <div class="row">
+  <div class="col-md-6"><div class="card"><div class="card-header"><h5 class="mb-0">Distribución de magnitudes</h5></div><div class="card-body"><canvas id="g-mag"></canvas></div></div></div>
+  <div class="col-md-6"><div class="card"><div class="card-header"><h5 class="mb-0">Distribución de profundidad</h5></div><div class="card-body"><canvas id="g-prof"></canvas></div></div></div>
+ </div>
+ <div class="card"><div class="card-header"><h5 class="mb-0">Actividad sísmica a lo largo del tiempo (por mes)</h5></div><div class="card-body"><canvas id="g-tiempo"></canvas></div></div>
+
+ <div class="card"><div class="card-header"><h5 class="mb-0">Estados con mayor riesgo sísmico y población (top 10)</h5></div><div class="card-body">
+  <div class="table-responsive"><table class="table table-striped"><thead><tr><th>Estado</th><th>Sismos</th><th>Magnitud prom.</th><th>Población total</th><th>Índice de riesgo</th></tr></thead><tbody id="tabla"></tbody></table></div>
+  <small class="text-muted">Índice = (sismos × magnitud promedio) / ln(población + 1), igual que en la versión PHP.</small></div></div>
+ <p class="text-center text-muted small mb-4">Proyecto original: Seismic-Data-Visualization-System (PHP + PostgreSQL + Docker). Esta versión lee JSON precalculados desde las mismas tablas del data warehouse.</p>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/leaflet@1.7.1/dist/leaflet.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.heat/0.2.0/leaflet-heat.js"></script>
+<script>
+let D, Z, mapa, capas, charts = {};
+const $ = id => document.getElementById(id);
+const color = m => m>=7?'#ff0000':m>=6?'#ff6600':m>=5?'#ffcc00':m>=4?'#e6e600':'#00cc00';
+const fmt = n => Number(n).toLocaleString('es-MX');
+const f2n = s => s ? parseInt(s.replace(/-/g,'')) : null;
+const n2f = n => { const s=String(n); return s.slice(0,4)+'-'+s.slice(4,6)+'-'+s.slice(6,8); };
+
+async function init(){
+  try{
+    const [a,b] = await Promise.all([fetch('datos/sismos.json').then(r=>r.json()), fetch('datos/zonas.json').then(r=>r.json())]);
+    D=a; Z=b;
+  }catch(e){ $('estado').innerHTML='<div class="alert alert-danger">No se pudieron cargar los datos: '+e.message+'<br>Si abriste el archivo con doble clic, sírvelo con un servidor (python -m http.server) o ábrelo desde GitHub Pages.</div>'; return; }
+  $('estado').style.display='none'; $('app').style.display='block';
+  mapa = L.map('mapa-sismos',{preferCanvas:true}).setView([23.6345,-102.5528],5);
+  const base = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{attribution:'&copy; OpenStreetMap contributors'}).addTo(mapa);
+  capas = {puntos:L.layerGroup().addTo(mapa), calor:L.layerGroup()};
+  L.control.layers({OpenStreetMap:base},{'Puntos sísmicos':capas.puntos,'Mapa de calor':capas.calor}).addTo(mapa);
+  const q = new URLSearchParams(location.search);
+  if(q.get('fecha_inicio')) $('f-ini').value=q.get('fecha_inicio');
+  if(q.get('fecha_fin')) $('f-fin').value=q.get('fecha_fin');
+  if(q.get('magnitud_min')) $('f-mag').value=q.get('magnitud_min');
+  $('b-filtrar').onclick=render;
+  $('b-limpiar').onclick=()=>{$('f-ini').value='';$('f-fin').value='';$('f-mag').value='0';render();};
+  $('b-csv').onclick=exportarCSV;
+  render();
+}
+
+function filtrar(){
+  const ini=f2n($('f-ini').value), fin=f2n($('f-fin').value), mm=parseFloat($('f-mag').value)||0;
+  const usaFecha = ini && fin, idx=[];
+  for(let i=0;i<D.n;i++){
+    if(usaFecha && (D.fecha[i]<ini || D.fecha[i]>fin)) continue;
+    if(mm>0 && D.mag[i]<mm) continue;
+    idx.push(i);
+  }
+  return {idx, ini:usaFecha?ini:null, fin:usaFecha?fin:null, mm};
+}
+
+function render(){
+  const F=filtrar(), idx=F.idx;
+  $('resumen').innerHTML='<b>Mostrando:</b> '+fmt(idx.length)+' sismos'+(F.ini?' · <b>Periodo:</b> '+n2f(F.ini)+' a '+n2f(F.fin):'')+(F.mm>0?' · <b>Magnitud mínima:</b> '+F.mm+'+':'');
+  dibujarMapa(idx); dibujarGraficas(idx); dibujarTabla(idx);
+}
+
+function dibujarMapa(idx){
+  capas.puntos.clearLayers(); capas.calor.clearLayers();
+  const LIM=4000;
+  const orden = idx.length>LIM ? idx.slice().sort((a,b)=>D.mag[b]-D.mag[a]).slice(0,LIM) : idx;
+  const canvas = L.canvas({padding:0.5});
+  orden.forEach(i=>{
+    L.circle([D.lat[i],D.lon[i]],{renderer:canvas,color:color(D.mag[i]),fillColor:color(D.mag[i]),fillOpacity:.7,weight:1,radius:D.mag[i]*5000})
+     .bindPopup('<b>Magnitud:</b> '+D.mag[i]+'<br><b>Fecha:</b> '+n2f(D.fecha[i])+'<br><b>Hora:</b> '+D.hora[i]+'<br><b>Profundidad:</b> '+D.prof[i]+' km<br><b>Ref.:</b> '+D.refs[D.ref[i]])
+     .addTo(capas.puntos);
+  });
+  const heat = idx.map(i=>[D.lat[i],D.lon[i],D.mag[i]*0.5]);
+  capas.calor.addLayer(L.heatLayer(heat,{radius:25,blur:15,maxZoom:10,max:8,gradient:{0.4:'blue',0.6:'cyan',0.7:'lime',0.8:'yellow',1.0:'red'}}));
+  $('nota-mapa').textContent = idx.length>LIM ? 'Puntos: se dibujan los '+fmt(LIM)+' de mayor magnitud para mantener el mapa fluido. El mapa de calor (control de capas, arriba a la derecha) usa los '+fmt(idx.length)+' sismos.' : '';
+}
+
+function grafica(id,cfg){ if(charts[id]) charts[id].destroy(); charts[id]=new Chart($(id),cfg); }
+
+function dibujarGraficas(idx){
+  const mags={'<4':0,'4-5':0,'5-6':0,'6-7':0,'7+':0}, prof={'Superficial (<50 km)':0,'Intermedio (50-150 km)':0,'Profundo (>150 km)':0}, mes={};
+  idx.forEach(i=>{
+    const m=D.mag[i], p=D.prof[i];
+    mags[m<4?'<4':m<5?'4-5':m<6?'5-6':m<7?'6-7':'7+']++;
+    prof[p<50?'Superficial (<50 km)':p<150?'Intermedio (50-150 km)':'Profundo (>150 km)']++;
+    const k=String(D.fecha[i]).slice(0,4)+'-'+String(D.fecha[i]).slice(4,6);
+    if(!mes[k]) mes[k]={n:0,max:0}; mes[k].n++; if(m>mes[k].max) mes[k].max=m;
+  });
+  grafica('g-mag',{type:'bar',data:{labels:Object.keys(mags),datasets:[{label:'Sismos',data:Object.values(mags),backgroundColor:['#00cc00','#e6e600','#ffcc00','#ff6600','#ff0000']}]},options:{plugins:{legend:{display:false}}}});
+  grafica('g-prof',{type:'doughnut',data:{labels:Object.keys(prof),datasets:[{data:Object.values(prof),backgroundColor:['#4e79a7','#f28e2b','#e15759']}]}});
+  const ks=Object.keys(mes).sort();
+  grafica('g-tiempo',{type:'line',data:{labels:ks,datasets:[
+    {label:'Número de sismos',data:ks.map(k=>mes[k].n),borderColor:'#1e3a5f',pointRadius:0,borderWidth:1.5,yAxisID:'y'},
+    {label:'Magnitud máxima',data:ks.map(k=>mes[k].max),borderColor:'#e15759',pointRadius:0,borderWidth:1,yAxisID:'y1'}]},
+    options:{interaction:{mode:'index',intersect:false},scales:{x:{ticks:{maxTicksLimit:14}},y:{position:'left',title:{display:true,text:'Sismos'}},y1:{position:'right',grid:{drawOnChartArea:false},title:{display:true,text:'Magnitud'}}}}});
+}
+
+function dibujarTabla(idx){
+  const est={};
+  idx.forEach(i=>{const z=D.zona[i]; (est[z]=est[z]||{n:0,s:0}); est[z].n++; est[z].s+=D.mag[i];});
+  const filas=Object.keys(est).map(z=>{const e=est[z], p=Z[z].poblacion_total, prom=e.s/e.n;
+    return {nombre:Z[z].nombre,n:e.n,prom,p,ind:(e.n*prom)/Math.log(p+1)};}).sort((a,b)=>b.ind-a.ind).slice(0,10);
+  $('tabla').innerHTML=filas.map(f=>'<tr><td>'+f.nombre+'</td><td>'+fmt(f.n)+'</td><td>'+f.prom.toFixed(1)+'</td><td>'+fmt(f.p)+'</td><td>'+f.ind.toFixed(2)+'</td></tr>').join('');
+}
+
+function exportarCSV(){
+  const {idx}=filtrar();
+  const out=['id,magnitud,latitud,longitud,profundidad,fecha,hora,estado,referencia'];
+  idx.forEach(i=>out.push([i,D.mag[i],D.lat[i],D.lon[i],D.prof[i],n2f(D.fecha[i]),D.hora[i],Z[D.zona[i]].nombre,'"'+D.refs[D.ref[i]].replace(/"/g,'""')+'"'].join(',')));
+  const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([out.join('\n')],{type:'text/csv'})); a.download='sismos_filtrados.csv'; a.click();
+}
+init();
+</script>
+</body></html>
